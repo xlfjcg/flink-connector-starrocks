@@ -2,7 +2,6 @@ package com.starrocks.connector.flink.row.source;
 
 import com.starrocks.connector.flink.tools.DataUtil;
 
-
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DecimalVector;
@@ -13,21 +12,13 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
-
 import org.apache.arrow.vector.types.Types;
-
 import org.apache.flink.table.data.DecimalData;
-
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
-
 import org.apache.flink.util.Preconditions;
 
-
-
-
 import java.math.BigDecimal;
-
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;

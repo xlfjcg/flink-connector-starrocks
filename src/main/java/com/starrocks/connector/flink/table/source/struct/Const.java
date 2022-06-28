@@ -14,13 +14,12 @@
 
 package com.starrocks.connector.flink.table.source.struct;
 
-import java.util.HashMap;
-
-
 import com.starrocks.connector.flink.row.source.StarRocksToFlinkTrans;
 import com.starrocks.connector.flink.row.source.StarRocksToFlinkTranslators;
 
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
+
+import java.util.HashMap;
 
 public class Const {
 
