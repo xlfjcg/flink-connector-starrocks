@@ -18,7 +18,6 @@ import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
@@ -35,11 +34,11 @@ import org.slf4j.LoggerFactory;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> implements CheckpointedFunction, CheckpointListener, Serializable {
@@ -53,8 +52,8 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
     private final StarRocksISerializer serializer;
     private final StarRocksIRowTransformer<T> rowTransformer;
 
-    private transient volatile ListState<Tuple2<Long, StreamLoadSnapshot>> snapshotStates;
-    private final Map<Long, StreamLoadSnapshot> snapshotMap = new LinkedHashMap<>();
+    private transient volatile ListState<Map<Long, List<StreamLoadSnapshot>>> snapshotStates;
+    private final Map<Long, List<StreamLoadSnapshot>> snapshotMap = new ConcurrentHashMap<>();
 
     public StarRocksDynamicSinkFunctionV2(StarRocksSinkOptions sinkOptions,
                                           TableSchema schema,
@@ -160,36 +159,18 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
         if (rowTransformer != null) {
             rowTransformer.setRuntimeContext(getRuntimeContext());
         }
-
-        synchronized (snapshotMap) {
-            for (Tuple2<Long, StreamLoadSnapshot> tuple : snapshotStates.get()) {
-                if (!sinkManager.commit(tuple.f1)) {
-                    snapshotMap.put(tuple.f0, tuple.f1);
-                }
-            }
-        }
-
-        if (!snapshotMap.isEmpty()) {
-            String labels = snapshotMap.values().stream()
-                    .map(StreamLoadSnapshot::getTransactions)
-                    .flatMap(Collection::stream)
-                    .map(tx -> tx.getDatabase() + "-" + tx.getLabel())
-                    .collect(Collectors.joining(","));
-
-            throw new RuntimeException(String.format("Open failed, some labels are not commit (%s)", labels));
-        }
     }
 
     @Override
     public void finish() {
         sinkManager.flush();
-        StreamLoadSnapshot snapshot = sinkManager.snapshot();
-        sinkManager.commit(snapshot);
     }
 
     @Override
     public void close() {
         sinkManager.flush();
+        StreamLoadSnapshot snapshot = sinkManager.snapshot();
+        sinkManager.abort(snapshot);
         sinkManager.close();
     }
 
@@ -199,14 +180,10 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
         StreamLoadSnapshot snapshot = sinkManager.snapshot();
 
         if (sinkManager.prepare(snapshot)) {
-            synchronized (snapshotMap) {
-                snapshotMap.put(functionSnapshotContext.getCheckpointId(), snapshot);
-            }
+            snapshotMap.put(functionSnapshotContext.getCheckpointId(), Collections.singletonList(snapshot));
 
             snapshotStates.clear();
-            for (Map.Entry<Long, StreamLoadSnapshot> entry : snapshotMap.entrySet()) {
-                snapshotStates.add(Tuple2.of(entry.getKey(), entry.getValue()));
-            }
+            snapshotStates.add(snapshotMap);
         } else {
             throw new RuntimeException("Snapshot state failed by prepare");
         }
@@ -214,42 +191,53 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
 
     @Override
     public void initializeState(FunctionInitializationContext functionInitializationContext) throws Exception {
-        ListStateDescriptor<Tuple2<Long, StreamLoadSnapshot>> descriptor =
+        ListStateDescriptor<Map<Long, List<StreamLoadSnapshot>>> descriptor =
                 new ListStateDescriptor<>(
                         "starrocks-sink-transaction",
-                        TypeInformation.of(new TypeHint<Tuple2<Long, StreamLoadSnapshot>>() {})
+                        TypeInformation.of(new TypeHint<Map<Long, List<StreamLoadSnapshot>>>() {})
                 );
         snapshotStates = functionInitializationContext.getOperatorStateStore().getListState(descriptor);
+
+        if (functionInitializationContext.isRestored()) {
+            for (Map<Long, List<StreamLoadSnapshot>> state : snapshotStates.get()) {
+                for (Map.Entry<Long, List<StreamLoadSnapshot>> entry : state.entrySet()) {
+                    snapshotMap.compute(entry.getKey(), (k, v) -> {
+                        if (v == null) {
+                            return new ArrayList<>(entry.getValue());
+                        }
+                        v.addAll(entry.getValue());
+                        return v;
+                    });
+                }
+            }
+        }
     }
 
     @Override
     public void notifyCheckpointComplete(long checkpointId) throws Exception {
-        StreamLoadSnapshot snapshot = snapshotMap.get(checkpointId);
-        if (snapshot == null) {
-            log.warn("Unknown checkpoint id : {}", checkpointId);
-            return;
-        }
 
         boolean succeed = true;
 
-        List<Long> removeCheckpointId = new ArrayList<>();
+        List<Long> commitCheckpointIds = snapshotMap.keySet().stream()
+                .filter(cpId -> cpId <= checkpointId)
+                .sorted(Long::compare)
+                .collect(Collectors.toList());
 
-        for (Map.Entry<Long, StreamLoadSnapshot> pending : snapshotMap.entrySet()) {
-            if (pending.getKey() > checkpointId) {
-                break;
+        for (Long cpId : commitCheckpointIds) {
+            List<StreamLoadSnapshot> failedSnapshot = new ArrayList<>();
+
+            for (StreamLoadSnapshot snapshot : snapshotMap.get(cpId)) {
+                if (!sinkManager.commit(snapshot)) {
+                    failedSnapshot.add(snapshot);
+                    succeed = false;
+                }
             }
-
-            if (sinkManager.commit(pending.getValue())) {
-                removeCheckpointId.add(pending.getKey());
-            } else {
-                succeed = false;
-            }
-        }
-
-        synchronized (snapshotMap) {
-            for (Long cpId : removeCheckpointId) {
+            if (failedSnapshot.isEmpty()) {
                 snapshotMap.remove(cpId);
+            } else {
+                snapshotMap.put(cpId, failedSnapshot);
             }
+
         }
 
         if (!succeed) {
@@ -262,13 +250,5 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
     @Override
     public void notifyCheckpointAborted(long checkpointId) throws Exception {
         // TODO
-//        StreamLoadSnapshot snapshot = snapshotMap.get(checkpointId);
-//        if (snapshot == null) {
-//            log.warn("Unknown checkpoint id : {}", checkpointId);
-//            return;
-//        }
-//
-//        sinkManager.abort(snapshot);
-//        snapshotMap.remove(checkpointId);
     }
 }
