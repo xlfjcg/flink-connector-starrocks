@@ -52,7 +52,7 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
     private final StarRocksISerializer serializer;
     private final StarRocksIRowTransformer<T> rowTransformer;
 
-    private transient volatile ListState<Map<Long, List<StreamLoadSnapshot>>> snapshotStates;
+    private transient volatile ListState<StarrocksSnapshotState> snapshotStates;
     private final Map<Long, List<StreamLoadSnapshot>> snapshotMap = new ConcurrentHashMap<>();
 
     public StarRocksDynamicSinkFunctionV2(StarRocksSinkOptions sinkOptions,
@@ -159,6 +159,7 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
         if (rowTransformer != null) {
             rowTransformer.setRuntimeContext(getRuntimeContext());
         }
+        notifyCheckpointComplete(Long.MAX_VALUE);
     }
 
     @Override
@@ -183,7 +184,7 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
             snapshotMap.put(functionSnapshotContext.getCheckpointId(), Collections.singletonList(snapshot));
 
             snapshotStates.clear();
-            snapshotStates.add(snapshotMap);
+            snapshotStates.add(StarrocksSnapshotState.of(snapshotMap));
         } else {
             throw new RuntimeException("Snapshot state failed by prepare");
         }
@@ -191,16 +192,16 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
 
     @Override
     public void initializeState(FunctionInitializationContext functionInitializationContext) throws Exception {
-        ListStateDescriptor<Map<Long, List<StreamLoadSnapshot>>> descriptor =
+        ListStateDescriptor<StarrocksSnapshotState> descriptor =
                 new ListStateDescriptor<>(
                         "starrocks-sink-transaction",
-                        TypeInformation.of(new TypeHint<Map<Long, List<StreamLoadSnapshot>>>() {})
+                        TypeInformation.of(new TypeHint<StarrocksSnapshotState>() {})
                 );
         snapshotStates = functionInitializationContext.getOperatorStateStore().getListState(descriptor);
 
         if (functionInitializationContext.isRestored()) {
-            for (Map<Long, List<StreamLoadSnapshot>> state : snapshotStates.get()) {
-                for (Map.Entry<Long, List<StreamLoadSnapshot>> entry : state.entrySet()) {
+            for (StarrocksSnapshotState state : snapshotStates.get()) {
+                for (Map.Entry<Long, List<StreamLoadSnapshot>> entry : state.getData().entrySet()) {
                     snapshotMap.compute(entry.getKey(), (k, v) -> {
                         if (v == null) {
                             return new ArrayList<>(entry.getValue());
@@ -224,20 +225,18 @@ public class StarRocksDynamicSinkFunctionV2<T> extends RichSinkFunction<T> imple
                 .collect(Collectors.toList());
 
         for (Long cpId : commitCheckpointIds) {
-            List<StreamLoadSnapshot> failedSnapshot = new ArrayList<>();
 
             for (StreamLoadSnapshot snapshot : snapshotMap.get(cpId)) {
                 if (!sinkManager.commit(snapshot)) {
-                    failedSnapshot.add(snapshot);
                     succeed = false;
+                    break;
                 }
             }
-            if (failedSnapshot.isEmpty()) {
-                snapshotMap.remove(cpId);
-            } else {
-                snapshotMap.put(cpId, failedSnapshot);
-            }
 
+            if (!succeed) {
+                break;
+            }
+            snapshotMap.remove(cpId);
         }
 
         if (!succeed) {
